@@ -21,11 +21,17 @@ Key design points
 
 from __future__ import annotations
 
-import math
+from pathlib import Path
 from typing import Callable
 
 import torch
 import torch.nn as nn
+import yaml
+
+
+def _load_config() -> dict:
+    with Path("zo_config.yaml").open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
 class ZeroOrderOptimizer:
@@ -76,19 +82,26 @@ class ZeroOrderOptimizer:
                 f"got '{perturbation_mode}'"
             )
         self.perturbation_mode = perturbation_mode
+        self.config = _load_config()
+        self.use_lora = bool(self.config["use_lora"])
+        self.lora_rank = int(self.config["lora_rank"])
+        self.layer_names: list[str] = ["fc.weight"] if self.use_lora else ["fc.bias"]
 
-        # ------------------------------------------------------------------
-        # STUDENT: Set self.layer_names to the parameters you want to tune.
-        #
-        # The default below selects only the final classification head.
-        # You may replace this with any subset of named parameters, e.g.:
-        #   self.layer_names = ["layer4.1.conv2.weight", "fc.weight", "fc.bias"]
-        #
-        # You can also update self.layer_names inside .step() to implement
-        # a dynamic schedule (e.g. gradually unfreeze deeper layers).
-        # ------------------------------------------------------------------
-        self.layer_names: list[str] = ["fc.weight", "fc.bias"]
-        # ------------------------------------------------------------------
+        self.bias_lr = 0.05
+        self.bias_eps = 0.01
+        self.lora_lr = 0.02
+        self.lora_eps = 0.01
+        self.rng = torch.Generator(device="cpu")
+        self.rng.manual_seed(42)
+
+        self.weight0 = self.model.fc.weight.detach().cpu().clone()
+        self.a = torch.zeros(self.weight0.shape[0], self.lora_rank, dtype=self.weight0.dtype)
+        self.b = torch.randn(
+            self.lora_rank,
+            self.weight0.shape[1],
+            generator=self.rng,
+            dtype=self.weight0.dtype,
+        ) / (self.weight0.shape[1] ** 0.5)
 
     # ------------------------------------------------------------------
     # Internal helpers — students may modify these.
@@ -126,15 +139,24 @@ class ZeroOrderOptimizer:
         Returns:
             A tensor of the same shape as ``param``, normalised to unit L2 norm.
         """
-        if self.perturbation_mode == "gaussian":
-            u = torch.randn_like(param)
-        else:  # uniform
-            u = torch.rand_like(param) * 2.0 - 1.0
+        u = torch.randint(
+            0,
+            2,
+            param.shape,
+            generator=self.rng,
+            device="cpu",
+            dtype=torch.int64,
+        ).to(dtype=param.dtype)
+        return u.mul_(2.0).sub_(1.0).to(device=param.device)
 
-        norm = u.norm()
-        if norm > 0:
-            u = u / norm
-        return u
+    def _materialize_lora_weight(self, a_value: torch.Tensor | None = None) -> None:
+        if a_value is None:
+            a_value = self.a
+        weight = self.weight0.to(device=self.model.fc.weight.device, dtype=self.model.fc.weight.dtype)
+        a_value = a_value.to(device=self.model.fc.weight.device, dtype=self.model.fc.weight.dtype)
+        b_value = self.b.to(device=self.model.fc.weight.device, dtype=self.model.fc.weight.dtype)
+        with torch.no_grad():
+            self.model.fc.weight.copy_(weight + a_value @ b_value)
 
     def _estimate_grad(
         self,
@@ -174,21 +196,33 @@ class ZeroOrderOptimizer:
         grads: dict[str, torch.Tensor] = {}
 
         with torch.no_grad():
+            if self.use_lora:
+                delta_a = self._sample_direction(self.a)
+                a_plus = self.a + self.lora_eps * delta_a
+                a_minus = self.a - self.lora_eps * delta_a
+                self._materialize_lora_weight(a_plus)
+                f_plus = loss_fn()
+                self._materialize_lora_weight(a_minus)
+                f_minus = loss_fn()
+                self._materialize_lora_weight(self.a)
+                grads["fc.weight"] = ((f_plus - f_minus) / (2.0 * self.lora_eps)) * delta_a
+                return grads
+
             for name, param in params.items():
                 u = self._sample_direction(param)
 
                 # f(x + eps * u)
-                param.data.add_(self.eps * u)
+                param.data.add_(self.bias_eps * u)
                 f_plus = loss_fn()
 
                 # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
+                param.data.sub_(2.0 * self.bias_eps * u)
                 f_minus = loss_fn()
 
                 # Restore original value
-                param.data.add_(self.eps * u)
+                param.data.add_(self.bias_eps * u)
 
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
+                grad_estimate = ((f_plus - f_minus) / (2.0 * self.bias_eps)) * u
                 grads[name] = grad_estimate
 
         return grads
@@ -219,8 +253,13 @@ class ZeroOrderOptimizer:
         # STUDENT: Replace or extend the parameter update below.
         # ------------------------------------------------------------------
         with torch.no_grad():
+            if self.use_lora:
+                self.a.sub_(self.lora_lr * grads["fc.weight"].cpu())
+                self._materialize_lora_weight(self.a)
+                return
+
             for name, param in params.items():
-                param.data.sub_(self.lr * grads[name])
+                param.data.sub_(self.bias_lr * grads[name])
         # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
@@ -254,6 +293,8 @@ class ZeroOrderOptimizer:
 
         # Record the loss before any perturbation.
         with torch.no_grad():
+            if self.use_lora:
+                self._materialize_lora_weight(self.a)
             loss_before = loss_fn()
 
         grads = self._estimate_grad(loss_fn, params)

@@ -1,0 +1,5 @@
+init_method: lda
+use_lora: true
+lora_rank: 16
+ridge_alpha: 10
+top_p: 0.9

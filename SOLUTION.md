@@ -50,8 +50,8 @@ $$
 W = W_0 + A B
 $$
 
-where $W_0$ is the initialized weight, $A$ is optimized, and $B$ is a fixed random basis from $\cal{N}(0, 1)$ scaled by $1 / sqrt(512)$.
+where $W_0$ is the initialized weight, $A$ is optimized, and $B$ is a fixed random basis from $\cal{N}(0, 1)$ scaled by $1 / \sqrt{512}$.
 
-I also tried the full version where both low-rank factors were learnable, but it was probably unstable and the quality was near-zero. The fixed-basis version that actually works only in random subspace is believed to have a better optimization landscape and it worked for me.
+I also tried the full version where both low-rank factors were learnable, but it was probably unstable and the quality was near-zero. The fixed-basis version that works only in random subspace is believed to have a simpler optimization landscape and it worked for me.
 
 The gains from lora are moderate, especially for the already good LDA, but as we say, it's a fair job: it turns 0.5988 initialization into 0.6001 final result.
